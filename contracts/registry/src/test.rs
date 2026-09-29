@@ -35,6 +35,43 @@ fn handle_event(
     )
 }
 
+/// `init` is one-shot: a second call must not take over, whoever makes it. The first admin
+/// keeps its rights, so an initialized contract cannot be re-pointed at a new admin.
+#[test]
+fn init_twice_reverts_and_keeps_the_first_admin() {
+    let (env, client, admin) = setup();
+    let impostor = Address::generate(&env);
+
+    assert_eq!(
+        client.try_init(&impostor),
+        Err(Ok(Error::AlreadyInitialized.into()))
+    );
+    assert_eq!(
+        client.try_init(&admin),
+        Err(Ok(Error::AlreadyInitialized.into()))
+    );
+
+    // still the first admin, not the impostor: a forced release asks the first admin to sign
+    let squatter = claimed(&env, &client, "brand");
+    client.admin_release(&symbol_short!("brand"));
+    assert_eq!(
+        env.auths(),
+        std::vec![(
+            admin.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    client.address.clone(),
+                    Symbol::new(&env, "admin_release"),
+                    (symbol_short!("brand"),).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        )]
+    );
+    assert_eq!(client.resolve(&symbol_short!("brand")), None);
+    assert_eq!(client.reverse(&squatter), None);
+}
+
 #[test]
 fn claim_sets_forward_and_reverse() {
     let (env, client, _admin) = setup();
@@ -62,6 +99,32 @@ fn claim_taken_by_other_reverts() {
     client.claim(&bob, &symbol_short!("star")); // panics: HandleTaken
 }
 
+/// A rename onto someone else's handle is a `claim` like any other, so it reverts with
+/// `HandleTaken` and the whole call rolls back: alice keeps `a` (it is not freed on the way),
+/// bob keeps `b`.
+#[test]
+fn renaming_into_a_taken_handle_reverts_and_changes_nothing() {
+    let (env, client, _admin) = setup();
+    let alice = claimed(&env, &client, "a");
+    let bob = claimed(&env, &client, "b");
+
+    assert_eq!(
+        client.try_claim(&alice, &symbol_short!("b")),
+        Err(Ok(Error::HandleTaken.into()))
+    );
+
+    assert_eq!(client.reverse(&alice), Some(symbol_short!("a")));
+    assert_eq!(client.resolve(&symbol_short!("a")), Some(alice));
+    assert_eq!(client.resolve(&symbol_short!("b")), Some(bob.clone()));
+    assert_eq!(client.reverse(&bob), Some(symbol_short!("b")));
+    // `a` is still held, so nobody else can take it
+    let carol = Address::generate(&env);
+    assert_eq!(
+        client.try_claim(&carol, &symbol_short!("a")),
+        Err(Ok(Error::HandleTaken.into()))
+    );
+}
+
 #[test]
 fn first_claim_emits_claimed() {
     let (env, client, _admin) = setup();
@@ -71,6 +134,28 @@ fn first_claim_emits_claimed() {
         env.events().all(),
         vec![&env, handle_event(&client, "claimed", &alice, "alice")]
     );
+}
+
+/// `handle/claimed` and `handle/released` are frozen in docs/ON_CHAIN_EVENTS.md and are the
+/// only way an indexer learns a handle changed hands, so their topics and payload order are
+/// pinned end to end: the claim announces `claimed`, the release announces `released`.
+#[test]
+fn claim_and_release_publish_the_documented_payloads() {
+    let (env, client, _admin) = setup();
+    let alice = claimed(&env, &client, "alice");
+
+    assert_eq!(
+        env.events().all(),
+        vec![&env, handle_event(&client, "claimed", &alice, "alice")]
+    );
+
+    client.release(&alice);
+    assert_eq!(
+        env.events().all(),
+        vec![&env, handle_event(&client, "released", &alice, "alice")]
+    );
+    // both applied in order, the indexer is left with nothing for this handle
+    assert_eq!(client.resolve(&symbol_short!("alice")), None);
 }
 
 #[test]
@@ -106,6 +191,8 @@ fn rename_frees_the_old_handle() {
     assert_eq!(client.reverse(&alice), Some(symbol_short!("new")));
 }
 
+/// Freeing a handle has to be real, not cosmetic: once alice renames away, another address
+/// can take the old name, and each reverse record follows its own holder.
 #[test]
 fn renamed_away_handle_is_reclaimable_by_another() {
     let (env, client, _admin) = setup();
@@ -118,8 +205,10 @@ fn renamed_away_handle_is_reclaimable_by_another() {
         env.events().all(),
         vec![&env, handle_event(&client, "claimed", &bob, "old")]
     );
-    assert_eq!(client.resolve(&symbol_short!("old")), Some(bob));
-    assert_eq!(client.resolve(&symbol_short!("new")), Some(alice));
+    assert_eq!(client.resolve(&symbol_short!("old")), Some(bob.clone()));
+    assert_eq!(client.resolve(&symbol_short!("new")), Some(alice.clone()));
+    assert_eq!(client.reverse(&bob), Some(symbol_short!("old")));
+    assert_eq!(client.reverse(&alice), Some(symbol_short!("new")));
 }
 
 #[test]
@@ -165,6 +254,33 @@ fn admin_release_clears_a_squatted_handle() {
     assert_eq!(client.resolve(&symbol_short!("brand")), Some(real));
 }
 
+/// Releasing a handle nobody holds is deliberately a silent no-op rather than a revert: the
+/// admin can sweep a list of handles without special-casing the free ones. Pinned so that
+/// turning it into an error, or giving it a voice, has to be a deliberate change.
+#[test]
+fn admin_release_of_an_unclaimed_handle_is_a_silent_no_op() {
+    let (env, client, _admin) = setup();
+    let alice = claimed(&env, &client, "alice");
+    client.set_meta(&alice, &FACE_03, &bio(&env, "not yours"));
+
+    client.admin_release(&symbol_short!("ghost"));
+
+    // nothing announced, nothing handed out, and no other holder disturbed
+    assert_eq!(env.events().all(), vec![&env]);
+    assert_eq!(client.resolve(&symbol_short!("ghost")), None);
+    assert_eq!(client.resolve(&symbol_short!("alice")), Some(alice.clone()));
+    assert_eq!(client.reverse(&alice), Some(symbol_short!("alice")));
+    assert_eq!(
+        client.get_meta(&alice),
+        Some(meta(&env, FACE_03, "not yours"))
+    );
+
+    // alice still owns her name and can hand it on, so the sweep changed nothing
+    client.release(&alice);
+    let bob = claimed(&env, &client, "alice");
+    assert_eq!(client.resolve(&symbol_short!("alice")), Some(bob));
+}
+
 /// Release build of this contract, committed so the upgrade path can be tested without a
 /// wasm build step in CI. Refresh with `make upgrade-fixtures` after changing the contract.
 const REGISTRY_WASM: &[u8] = include_bytes!("../testdata/alvinmunk_registry.wasm");
@@ -182,6 +298,10 @@ fn upgrade_to_identical_wasm_preserves_handles() {
 
     assert_eq!(client.resolve(&symbol_short!("alice")), Some(alice.clone()));
     assert_eq!(client.reverse(&alice), Some(symbol_short!("alice")));
+    assert_eq!(
+        client.reverse_many(&vec![&env, alice.clone()]),
+        vec![&env, Some(symbol_short!("alice"))]
+    );
     // the fixture build serves the profile written before the upgrade, and still takes writes
     let before = ProfileMeta {
         avatar: FACE_03,
@@ -275,6 +395,121 @@ fn resolve_does_not_extend_the_handle() {
         ttl(&env, &client, &DataKey::Fwd(symbol_short!("alice"))),
         BUMP_EXTEND - DAY_LEDGERS * 3
     );
+}
+
+// --- Batched reverse lookup ---
+
+/// `n` fresh addresses; every other one claims a handle (`h0`, `h2`, ...).
+fn some_claimed(env: &Env, client: &RegistryContractClient, n: u32) -> Vec<Address> {
+    let mut addrs = Vec::new(env);
+    for i in 0..n {
+        let a = Address::generate(env);
+        if i % 2 == 0 {
+            client.claim(&a, &Symbol::new(env, &std::format!("h{i}")));
+        }
+        addrs.push_back(a);
+    }
+    addrs
+}
+
+#[test]
+fn reverse_many_returns_handles_in_input_order() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env); // never claims
+    client.claim(&alice, &symbol_short!("alice"));
+    client.claim(&bob, &symbol_short!("bob"));
+    assert_eq!(
+        client.reverse_many(&vec![&env, bob.clone(), carol, alice.clone(), bob]),
+        vec![
+            &env,
+            Some(symbol_short!("bob")),
+            None,
+            Some(symbol_short!("alice")),
+            Some(symbol_short!("bob")),
+        ]
+    );
+}
+
+#[test]
+fn reverse_many_matches_reverse_after_rename_and_release() {
+    let (env, client, _admin) = setup();
+    let addrs = some_claimed(&env, &client, 6);
+    client.claim(&addrs.get(0).unwrap(), &symbol_short!("renamed"));
+    client.release(&addrs.get(2).unwrap());
+    let mut expected = Vec::new(&env);
+    for a in addrs.iter() {
+        expected.push_back(client.reverse(&a));
+    }
+    assert_eq!(expected.get(0).unwrap(), Some(symbol_short!("renamed")));
+    assert_eq!(expected.get(2).unwrap(), None);
+    assert_eq!(client.reverse_many(&addrs), expected);
+}
+
+#[test]
+fn reverse_many_of_nothing_is_empty() {
+    let (env, client, _admin) = setup();
+    assert_eq!(client.reverse_many(&vec![&env]), vec![&env]);
+}
+
+#[test]
+fn reverse_many_takes_up_to_the_cap_and_reverts_past_it() {
+    let (env, client, _admin) = setup();
+    let mut addrs = some_claimed(&env, &client, REVERSE_MANY_CAP);
+    let handles = client.reverse_many(&addrs);
+    assert_eq!(handles.len(), REVERSE_MANY_CAP);
+    assert_eq!(handles.get(0).unwrap(), Some(symbol_short!("h0")));
+    assert_eq!(handles.get(1).unwrap(), None);
+
+    addrs.push_back(Address::generate(&env));
+    assert_eq!(
+        client.try_reverse_many(&addrs),
+        Err(Ok(Error::TooMany.into()))
+    );
+}
+
+/// `reverse_many` is a pure read (the web app only simulates it): it writes nothing and
+/// extends nothing, just like `reverse`.
+#[test]
+fn reverse_many_does_not_write_or_extend() {
+    let (env, client) = setup_with_ttls(TESTNET_TTLS);
+    let addrs = some_claimed(&env, &client, 4);
+    env.ledger()
+        .with_mut(|l| l.sequence_number += DAY_LEDGERS * 3);
+
+    client.reverse_many(&addrs);
+    let used = env.cost_estimate().resources();
+    assert_eq!(used.write_entries, 0);
+    assert_eq!(used.persistent_entry_rent_bumps, 0);
+    assert_eq!(
+        ttl(&env, &client, &DataKey::Rev(addrs.get(0).unwrap())),
+        BUMP_EXTEND - DAY_LEDGERS * 3
+    );
+}
+
+/// A full batch against the release build stays far inside the per-transaction limits
+/// `REVERSE_MANY_CAP` was sized for (testnet and mainnet, checked 2026-09-29).
+#[test]
+fn a_full_reverse_many_fits_one_transaction() {
+    const TX_MAX_INSTRUCTIONS: i64 = 400_000_000;
+    const TX_MAX_FOOTPRINT_ENTRIES: u32 = 400;
+    const TX_MAX_DISK_READ_BYTES: u32 = 200_000;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(REGISTRY_WASM, ());
+    let client = RegistryContractClient::new(&env, &id);
+    client.init(&Address::generate(&env));
+    let addrs = some_claimed(&env, &client, REVERSE_MANY_CAP);
+
+    client.reverse_many(&addrs);
+    let used = env.cost_estimate().resources();
+    // one `Rev` key per address, plus the instance and the code
+    assert_eq!(used.read_entries, REVERSE_MANY_CAP + 2, "{used:?}");
+    assert!(used.read_entries < TX_MAX_FOOTPRINT_ENTRIES / 4, "{used:?}");
+    assert!(used.read_bytes < TX_MAX_DISK_READ_BYTES / 4, "{used:?}");
+    assert!(used.instructions < TX_MAX_INSTRUCTIONS / 4, "{used:?}");
 }
 
 // --- Profile meta (avatar + bio) ---
