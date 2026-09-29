@@ -240,7 +240,8 @@ export async function moveSubscription(
     memStore.set(newKey, moved);
     const wallet = moved.walletAddress.toLowerCase();
     if (!walletIndex.has(wallet)) walletIndex.set(wallet, new Set());
-    walletIndex.get(wallet)!.add(newKey);
+    // The index stores bare endpoints (see memSet/memDel), not `sub:`-prefixed keys.
+    walletIndex.get(wallet)!.add(newEp);
     if (oldKey !== newKey) memDel(oldKey);
   }
 
@@ -258,6 +259,6 @@ export async function getSubscriptionsForWallet(walletAddress: string): Promise<
     return subs.filter(Boolean) as StoredSubscription[];
   }
   const endpoints = walletIndex.get(wallet) ?? new Set<string>();
-  // The index stores full keys (`sub:<endpoint>`), so look them up directly.
-  return [...endpoints].map((ep) => memGet(ep)).filter(Boolean) as StoredSubscription[];
+  // The index stores bare endpoints (see memSet/memDel), so reconstruct the `sub:` key.
+  return [...endpoints].map((ep) => memGet(`sub:${ep}`)).filter(Boolean) as StoredSubscription[];
 }
